@@ -12,10 +12,11 @@ Panel
     Announcement   text shown in the embed (empty = the event's own description)
     Color          embed color (hex like #5865F2, or red / blue / gold / ...)
     Image URL      big picture at the bottom of the embed
-    Thumbnail URL  small picture in the corner (pre-filled with the event link)
     Host           pre-filled from the event, editable
     Location       pre-filled from the event, editable
     Reminder times e.g. "1 hour before, 2 hours before, at start"
+    Repeat         On = remind for EVERY occurrence of a recurring event
+                   (switched on automatically when Discord says the event recurs)
     Channel        dropdown
     Preview        shows exactly what will be posted (only you can see it)
     Post now       posts it straight away
@@ -23,8 +24,15 @@ Panel
 
 Other commands
     .event list                          show every pending reminder
-    .event cancel <event link or ID>     remove an event's reminders
+    .event cancel <event link or ID>     remove an event's reminders (stops a repeat too)
     .event cancel <event link> #channel  remove only that channel's reminders
+
+How repeating works
+    A recurring Discord event is one event whose start time moves to the next
+    occurrence once the current one is over. The bot posts each reminder for the
+    current occurrence, then keeps checking the event; as soon as the start time
+    moves, every reminder is lined up again at the same distance before the new
+    start. So "1 day before, 1 hour before, at start" happens every week.
 
 Needs discord.py 2.1+ (buttons, modals, channel select).
 """
@@ -47,6 +55,8 @@ MAX_REMINDERS_PER_EVENT = 10
 START_GRACE = 15 * 60              # an "at start" reminder later than this is dropped
 MAX_RETRIES = 3                    # send attempts before a failing reminder is dropped
 PANEL_TIMEOUT = 15 * 60            # seconds of inactivity before the panel stops working
+ROLLOVER_GRACE = 60                # start times closer than this (seconds) count as the same
+GIVE_UP_AFTER = 45 * 86400         # a repeating series with no new occurrence for this long is dropped
 
 DEFAULT_COLOR = "#5865F2"
 DEFAULT_CONFIG = {
@@ -54,7 +64,6 @@ DEFAULT_CONFIG = {
     "announcement": "",
     "color": DEFAULT_COLOR,
     "image_url": "",
-    "thumbnail_url": "",
     "host": "",
     "location": "",
 }
@@ -98,10 +107,6 @@ FIELD_SPECS = {
     "image_url": dict(
         label="Image URL", emoji="🖼️", row=0, title="Edit image URL", input="Image URL",
         placeholder="Direct link to an image (png, jpg, gif). Empty = no image", max=500,
-    ),
-    "thumbnail_url": dict(
-        label="Thumbnail URL", emoji="🔗", row=0, title="Edit thumbnail URL", input="Thumbnail URL",
-        placeholder="Small image in the corner of the embed. Empty = none", max=500,
     ),
     "host": dict(
         label="Host", emoji="👤", row=1, title="Edit host", input="Host",
@@ -255,19 +260,28 @@ def event_is_over(event: discord.ScheduledEvent) -> bool:
     return event.status in (discord.EventStatus.completed, discord.EventStatus.cancelled)
 
 
+def is_recurring(event: discord.ScheduledEvent) -> bool:
+    """True when Discord reports a recurrence rule (needs a discord.py that exposes it)."""
+    return getattr(event, "recurrence_rule", None) is not None
+
+
 def initial_config(event: discord.ScheduledEvent) -> dict:
     """Starting values for a brand-new setup. Host/location come from the event."""
     config = dict(DEFAULT_CONFIG)
     cover = getattr(event, "cover_image", None)
     config["image_url"] = cover.url if cover else ""
-    config["thumbnail_url"] = event.url
     config["host"] = f"<@{event.creator_id}>" if event.creator_id else ""
     config["location"] = event_location(event) or ""
     return config
 
 
-def build_reminder_embed(config: dict, event: discord.ScheduledEvent, offset: Optional[int] = None):
-    """The embed that gets posted (and previewed). Start time always comes from the live event."""
+def build_reminder_embed(
+    config: dict, event: discord.ScheduledEvent, offset: Optional[int] = None, start_ts: Optional[float] = None
+):
+    """
+    The embed that gets posted (and previewed).
+    start_ts lets a repeating reminder show the occurrence it was scheduled for.
+    """
     cfg = {**DEFAULT_CONFIG, **(config or {})}
     embed = discord.Embed(
         title=event.name,
@@ -280,7 +294,7 @@ def build_reminder_embed(config: dict, event: discord.ScheduledEvent, offset: Op
     if body:
         embed.description = short(body, 1500)
 
-    start = int(event.start_time.timestamp())
+    start = int(start_ts if start_ts is not None else event.start_time.timestamp())
     embed.add_field(name="🕒 Start", value=f"<t:{start}:F>\n(<t:{start}:R>)", inline=True)
     if cfg["location"]:
         embed.add_field(name="📍 Location", value=cfg["location"], inline=True)
@@ -289,9 +303,33 @@ def build_reminder_embed(config: dict, event: discord.ScheduledEvent, offset: Op
 
     if cfg["image_url"]:
         embed.set_image(url=cfg["image_url"])
-    if cfg["thumbnail_url"]:
-        embed.set_thumbnail(url=cfg["thumbnail_url"])
     return embed
+
+
+# ----- repeating-reminder bookkeeping ---------------------------------------- #
+def next_poll_time(now: float, tracked: float) -> float:
+    """When to next look at the event to see whether its next occurrence has appeared."""
+    if now < tracked:
+        return tracked + 300                       # occurrence still ahead: look just after it begins
+    return now + (600 if now - tracked < 86400 else 6 * 3600)
+
+
+def plan_rollover(offset: int, tracked: float, new_start: float, now: float) -> dict:
+    """
+    Fields to $set on a repeating reminder that has finished its occurrence (or is waiting).
+
+    * start time unchanged      -> keep waiting for the next occurrence
+    * start time moved          -> line the reminder up for the new start; if that time has
+                                   already passed, skip it for this occurrence and wait
+    """
+    if abs(new_start - tracked) <= ROLLOVER_GRACE:
+        return {"remind_at": None, "next_poll": next_poll_time(now, tracked)}
+    remind_at = new_start - offset
+    return {
+        "event_start": new_start,
+        "remind_at": remind_at if remind_at > now else None,
+        "next_poll": next_poll_time(now, new_start),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -324,7 +362,7 @@ class FieldModal(discord.ui.Modal):
 
 
 class EventSetupView(discord.ui.View):
-    def __init__(self, cog, ctx, event, config, channel_id, offsets, loaded=False):
+    def __init__(self, cog, ctx, event, config, channel_id, offsets, recurring=False, loaded=False):
         super().__init__(timeout=PANEL_TIMEOUT)
         self.cog = cog
         self.owner_id = ctx.author.id
@@ -333,6 +371,7 @@ class EventSetupView(discord.ui.View):
         self.config = config
         self.channel_id = channel_id
         self.offsets = offsets
+        self.recurring = recurring
         self.loaded = loaded
         self.message = None
 
@@ -344,11 +383,26 @@ class EventSetupView(discord.ui.View):
             button.callback = self._opener(key)
             self.add_item(button)
 
+        # Row 1: repeat toggle.
+        self.repeat_button = discord.ui.Button(emoji="🔁", row=1)
+        self.repeat_button.callback = self._toggle_repeat
+        self._style_repeat_button()
+        self.add_item(self.repeat_button)
+
     # ----- state helpers ------------------------------------------------- #
     def _opener(self, key):
         async def callback(interaction: discord.Interaction):
             await interaction.response.send_modal(FieldModal(self, key))
         return callback
+
+    def _style_repeat_button(self):
+        self.repeat_button.label = f"Repeat: {'On' if self.recurring else 'Off'}"
+        self.repeat_button.style = discord.ButtonStyle.success if self.recurring else discord.ButtonStyle.secondary
+
+    async def _toggle_repeat(self, interaction: discord.Interaction):
+        self.recurring = not self.recurring
+        self._style_repeat_button()
+        await interaction.response.edit_message(embed=self.panel_embed(), view=self)
 
     def field_text(self, key: str) -> str:
         if key == "timings":
@@ -363,10 +417,10 @@ class EventSetupView(discord.ui.View):
             self.config["mention"] = resolve_mention(self.guild, raw)
         elif key == "color":
             self.config["color"] = parse_color(raw) if raw else DEFAULT_COLOR
-        elif key in ("image_url", "thumbnail_url"):
+        elif key == "image_url":
             if raw and not re.fullmatch(r"https?://\S+", raw):
                 raise ValueError("That needs to be a full link starting with `http://` or `https://`.")
-            self.config[key] = raw
+            self.config["image_url"] = raw
         else:
             self.config[key] = raw
 
@@ -388,6 +442,8 @@ class EventSetupView(discord.ui.View):
             return short(value, limit) or "—"
 
         intro = f"**[{self.event.name}]({self.event.url})**\n"
+        if is_recurring(self.event):
+            intro += "🔁 *Discord shows this as a recurring event.*\n"
         if self.loaded:
             intro += "*Loaded your existing reminders for this event.*\n"
         intro += "Edit anything below, check it with **Preview**, then press **Schedule**."
@@ -405,13 +461,16 @@ class EventSetupView(discord.ui.View):
             name="⏰ Reminders",
             value="\n".join(f"• {offset_label(o)}" for o in self.offsets) or "⚠️ None set",
         )
+        embed.add_field(
+            name="🔁 Repeat",
+            value="On: every occurrence" if self.recurring else "Off: next occurrence only",
+        )
         embed.add_field(name="🎨 Color", value=f"`{cfg['color']}`")
         embed.add_field(name="📣 Mention", value=show(cfg["mention"]))
         embed.add_field(name="📢 Announcement", value=show(cfg["announcement"]) if cfg["announcement"] else "*Event description*")
         embed.add_field(name="👤 Host", value=show(cfg["host"]))
         embed.add_field(name="📍 Location", value=show(cfg["location"]))
         embed.add_field(name="🖼️ Image URL", value=show(cfg["image_url"], 80), inline=False)
-        embed.add_field(name="🔗 Thumbnail URL", value=show(cfg["thumbnail_url"], 80), inline=False)
         return embed
 
     # ----- view plumbing ------------------------------------------------- #
@@ -489,9 +548,9 @@ class EventSetupView(discord.ui.View):
             return await interaction.followup.send("❌ That event has already ended or been cancelled.", ephemeral=True)
 
         scheduled, skipped = await self.cog.schedule_reminders(
-            event, channel, self.offsets, self.config, interaction.user.id
+            event, channel, self.offsets, self.config, interaction.user.id, self.recurring
         )
-        if not scheduled:
+        if not scheduled and not self.recurring:
             return await interaction.followup.send(
                 f"❌ All of those times have already passed (the event starts <t:{int(event.start_time.timestamp())}:R>).",
                 ephemeral=True,
@@ -499,19 +558,22 @@ class EventSetupView(discord.ui.View):
 
         lines = [
             f"• **{offset_label(offset)}** → <t:{int(at)}:f> (<t:{int(at)}:R>)" for offset, at in scheduled
-        ]
+        ] or ["*No reminder time is left for this occurrence. They start with the next one.*"]
         done = discord.Embed(
             title="✅ Reminders scheduled",
             description=f"**[{event.name}]({event.url})**\nPosting in {channel.mention}\n\n" + "\n".join(lines),
             color=discord.Color.green(),
         )
-        if skipped:
+        if skipped and scheduled:
             done.add_field(
-                name="Skipped (already passed)",
+                name="Starts with the next occurrence" if self.recurring else "Skipped (already passed)",
                 value="\n".join(f"• {offset_label(offset)}" for offset, _ in skipped),
                 inline=False,
             )
-        done.set_footer(text="Run the command again with the same event to change anything.")
+        footer = "Run the command again with the same event to change anything."
+        if self.recurring:
+            footer = "🔁 Repeats for every occurrence. " + footer
+        done.set_footer(text=footer)
         self.stop()
         await interaction.edit_original_response(content=None, embed=done, view=None)
 
@@ -579,19 +641,20 @@ class EventReminder(commands.Cog):
         # If reminders already exist for this event, start from those so you can edit them.
         existing = await self._load_existing(guild.id, event.id)
         if existing:
-            channel_id, config, offsets = existing
+            channel_id, config, offsets, recurring = existing
         else:
-            channel_id, config, offsets = None, initial_config(event), []
+            channel_id, config, offsets, recurring = None, initial_config(event), [], is_recurring(event)
 
-        view = EventSetupView(self, ctx, event, config, channel_id, offsets, loaded=bool(existing))
+        view = EventSetupView(self, ctx, event, config, channel_id, offsets, recurring, loaded=bool(existing))
         view.message = await ctx.send(embed=view.panel_embed(), view=view)
 
     @event_cmd.command(name="list")
     async def event_list(self, ctx):
         """Show every pending event reminder."""
-        docs = await self.coll.find({}).sort("remind_at", 1).to_list(length=None)
+        docs = await self.coll.find({}).to_list(length=None)
         if not docs:
             return await ctx.send("There are no pending reminders.")
+        docs.sort(key=lambda d: (d.get("remind_at") is None, d.get("remind_at") or 0))
 
         groups = {}
         for doc in docs:
@@ -601,10 +664,15 @@ class EventReminder(commands.Cog):
         for (event_id, channel_id), items in groups.items():
             first = items[0]
             url = f"https://discord.com/events/{first['guild_id']}/{event_id}"
-            lines.append(f"**[{first['event_name']}]({url})** → <#{channel_id}>")
+            repeat = " 🔁" if any(d.get("recurring") for d in items) else ""
+            lines.append(f"**[{first['event_name']}]({url})**{repeat} → <#{channel_id}>")
             for doc in items:
-                ts = int(doc["remind_at"])
-                lines.append(f"> {offset_label(doc['offset_seconds'])}: <t:{ts}:f> (<t:{ts}:R>)")
+                label = offset_label(doc["offset_seconds"])
+                if doc.get("remind_at") is None:
+                    lines.append(f"> {label}: ⏳ waiting for the next occurrence")
+                else:
+                    ts = int(doc["remind_at"])
+                    lines.append(f"> {label}: <t:{ts}:f> (<t:{ts}:R>)")
             lines.append("")
 
         text = "\n".join(lines)
@@ -615,7 +683,7 @@ class EventReminder(commands.Cog):
     @event_cmd.command(name="cancel")
     async def event_cancel(self, ctx, event: str, channel: Optional[discord.TextChannel] = None):
         """
-        Cancel reminders for an event.
+        Cancel reminders for an event (this also stops a repeating series).
 
         Usage: event cancel <event link or ID> [channel]
         """
@@ -640,17 +708,25 @@ class EventReminder(commands.Cog):
     # Storage
     # ------------------------------------------------------------------ #
     async def _load_existing(self, guild_id: int, event_id: int):
-        docs = await self.coll.find({"guild_id": guild_id, "event_id": event_id}).sort("remind_at", 1).to_list(length=None)
+        docs = await self.coll.find({"guild_id": guild_id, "event_id": event_id}).to_list(length=None)
         if not docs:
             return None
+        docs.sort(key=lambda d: (d.get("remind_at") is None, d.get("remind_at") or 0))
         channel_id = docs[0]["channel_id"]
         same = [d for d in docs if d["channel_id"] == channel_id]
-        config = {**DEFAULT_CONFIG, **same[0].get("config", {})}
+        saved = same[0].get("config", {})
+        config = {key: saved.get(key, default) for key, default in DEFAULT_CONFIG.items()}
         offsets = sorted({d["offset_seconds"] for d in same}, reverse=True)
-        return channel_id, config, offsets
+        recurring = any(d.get("recurring") for d in same)
+        return channel_id, config, offsets, recurring
 
-    async def schedule_reminders(self, event, channel, offsets, config, author_id):
-        """Save reminders (replacing any earlier ones for this event + channel)."""
+    async def schedule_reminders(self, event, channel, offsets, config, author_id, recurring=False):
+        """
+        Save reminders (replacing any earlier ones for this event + channel).
+
+        Returns (scheduled, skipped) as lists of (offset, remind_at). Skipped times have already
+        passed for the current occurrence; a repeating series still keeps them for the next one.
+        """
         start_ts = event.start_time.timestamp()
         now = time.time()
         scheduled, skipped = [], []
@@ -658,7 +734,8 @@ class EventReminder(commands.Cog):
             remind_at = start_ts - offset
             (scheduled if remind_at > now else skipped).append((offset, remind_at))
 
-        if scheduled:
+        to_store = scheduled + (skipped if recurring else [])
+        if to_store:
             key = {"guild_id": event.guild.id, "event_id": event.id, "channel_id": channel.id}
             await self.coll.delete_many(key)
             await self.coll.insert_many(
@@ -668,40 +745,50 @@ class EventReminder(commands.Cog):
                         "event_name": event.name,
                         "event_start": start_ts,
                         "offset_seconds": offset,
-                        "remind_at": remind_at,
+                        "remind_at": remind_at if remind_at > now else None,
+                        "next_poll": next_poll_time(now, start_ts),
+                        "recurring": recurring,
                         "config": dict(config),
                         "created_by": author_id,
                         "attempts": 0,
                     }
-                    for offset, remind_at in scheduled
+                    for offset, remind_at in to_store
                 ]
             )
         return scheduled, skipped
 
     # ------------------------------------------------------------------ #
     # Keep reminders in sync with the event
-    # (needs the "guild scheduled events" intent; if it's off, reminders
-    #  still catch moved events at send time)
+    # (needs the "guild scheduled events" intent; if it's off, the checks
+    #  below still catch changes, just a few minutes later)
     # ------------------------------------------------------------------ #
     @commands.Cog.listener()
     async def on_scheduled_event_update(self, before, after):
+        key = {"guild_id": after.guild.id, "event_id": after.id}
+        now = time.time()
+        new_start = after.start_time.timestamp()
+
         if event_is_over(after):
-            await self.coll.delete_many({"guild_id": after.guild.id, "event_id": after.id})
+            # One-off events are finished. A repeating series waits for its next occurrence.
+            await self.coll.delete_many({**key, "recurring": {"$ne": True}})
             return
         if before.start_time == after.start_time and before.name == after.name:
             return
 
-        new_start = after.start_time.timestamp()
-        now = time.time()
-        async for doc in self.coll.find({"guild_id": after.guild.id, "event_id": after.id}):
-            remind_at = new_start - doc["offset_seconds"]
-            if remind_at <= now:
-                await self.coll.delete_one({"_id": doc["_id"]})  # event moved up; this one is stale
-            else:
-                await self.coll.update_one(
-                    {"_id": doc["_id"]},
-                    {"$set": {"remind_at": remind_at, "event_start": new_start, "event_name": after.name}},
-                )
+        async for doc in self.coll.find(key):
+            changes = {"event_name": after.name}
+            due = doc.get("remind_at") is not None and doc["remind_at"] <= now
+            if abs(new_start - doc["event_start"]) > ROLLOVER_GRACE and not due:
+                # (A due reminder is left alone: the loop sends it using the occurrence it was set for.)
+                if doc.get("recurring"):
+                    changes.update(plan_rollover(doc["offset_seconds"], doc["event_start"], new_start, now))
+                else:
+                    remind_at = new_start - doc["offset_seconds"]
+                    if remind_at <= now:
+                        await self.coll.delete_one({"_id": doc["_id"]})  # event moved up; this one is stale
+                        continue
+                    changes.update({"event_start": new_start, "remind_at": remind_at})
+            await self.coll.update_one({"_id": doc["_id"]}, {"$set": changes})
 
     @commands.Cog.listener()
     async def on_scheduled_event_delete(self, event):
@@ -712,6 +799,17 @@ class EventReminder(commands.Cog):
     # ------------------------------------------------------------------ #
     @tasks.loop(seconds=CHECK_INTERVAL)
     async def reminder_loop(self):
+        for step in (self._send_due, self._poll_waiting):
+            try:
+                await step()
+            except Exception:
+                logger.exception("Reminder loop step %s failed", step.__name__)
+
+    @reminder_loop.before_loop
+    async def before_reminder_loop(self):
+        await self.bot.wait_until_ready()
+
+    async def _send_due(self):
         due = await self.coll.find({"remind_at": {"$lte": time.time()}}).to_list(length=None)
         for doc in due:
             try:
@@ -723,48 +821,99 @@ class EventReminder(commands.Cog):
                 else:
                     await self.coll.update_one({"_id": doc["_id"]}, {"$inc": {"attempts": 1}})
 
-    @reminder_loop.before_loop
-    async def before_reminder_loop(self):
-        await self.bot.wait_until_ready()
-
     async def _fire(self, doc):
+        event_key = {"guild_id": doc["guild_id"], "event_id": doc["event_id"]}
         guild = self.bot.get_guild(doc["guild_id"])
         channel = self.bot.get_channel(doc["channel_id"])
         if guild is None or channel is None:
-            return await self.coll.delete_one({"_id": doc["_id"]})
+            return await self.coll.delete_many({**event_key, "channel_id": doc["channel_id"]})
 
         try:
             event = await guild.fetch_scheduled_event(doc["event_id"])
         except discord.NotFound:
-            return await self.coll.delete_one({"_id": doc["_id"]})
+            return await self.coll.delete_many(event_key)  # event was deleted
 
-        if event_is_over(event):
-            return await self.coll.delete_one({"_id": doc["_id"]})
-
+        recurring = doc.get("recurring", False)
         offset = doc["offset_seconds"]
-        start = event.start_time.timestamp()
+        tracked = doc["event_start"]          # the occurrence this reminder was scheduled for
+        current = event.start_time.timestamp()
         now = time.time()
 
-        # The event was moved later while we weren't listening: push the reminder back.
-        due_at = start - offset
-        if due_at > now + 60:
-            return await self.coll.update_one(
-                {"_id": doc["_id"]}, {"$set": {"remind_at": due_at, "event_start": start}}
-            )
+        if event_is_over(event):
+            # One-off: done. Repeating: this occurrence is over, wait for the next one.
+            return await self._complete(doc, event, tracked)
+
+        # The occurrence hasn't begun but the live event disagrees with our notes: it was edited.
+        if now < tracked and abs(current - tracked) > ROLLOVER_GRACE:
+            new_due = current - offset
+            if new_due > now + 60:
+                return await self.coll.update_one(
+                    {"_id": doc["_id"]}, {"$set": {"event_start": current, "remind_at": new_due}}
+                )
+            tracked = current  # moved earlier and already due: go with the new time
 
         # Too late to be useful (bot was offline, or the event moved up).
-        if offset > 0 and now >= start:
-            return await self.coll.delete_one({"_id": doc["_id"]})
-        if offset == 0 and now > start + START_GRACE:
-            return await self.coll.delete_one({"_id": doc["_id"]})
+        if (offset > 0 and now >= tracked) or (offset == 0 and now > tracked + START_GRACE):
+            return await self._complete(doc, event, tracked)
 
         config = doc.get("config", {})
         await channel.send(
             content=config.get("mention") or None,
-            embed=build_reminder_embed(config, event, offset),
+            embed=build_reminder_embed(config, event, offset, start_ts=tracked),
             allowed_mentions=ALLOW_PINGS,
         )
-        await self.coll.delete_one({"_id": doc["_id"]})
+        await self._complete(doc, event, tracked)
+
+    async def _complete(self, doc, event, tracked):
+        """This reminder is finished for its occurrence: delete it, or line it up for the next one."""
+        if not doc.get("recurring"):
+            return await self.coll.delete_one({"_id": doc["_id"]})
+        changes = plan_rollover(doc["offset_seconds"], tracked, event.start_time.timestamp(), time.time())
+        changes["attempts"] = 0
+        await self.coll.update_one({"_id": doc["_id"]}, {"$set": changes})
+
+    async def _poll_waiting(self):
+        """Repeating reminders that already fired: watch the event for its next occurrence."""
+        now = time.time()
+        waiting = await self.coll.find(
+            {"recurring": True, "remind_at": None, "next_poll": {"$lte": now}}
+        ).to_list(length=None)
+
+        by_event = {}
+        for doc in waiting:
+            by_event.setdefault((doc["guild_id"], doc["event_id"]), []).append(doc)
+
+        for (guild_id, event_id), items in by_event.items():
+            event_key = {"guild_id": guild_id, "event_id": event_id}
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                continue
+            try:
+                event = await guild.fetch_scheduled_event(event_id)
+            except discord.NotFound:
+                await self.coll.delete_many(event_key)  # event was deleted
+                continue
+            except discord.HTTPException:
+                await self.coll.update_many(
+                    {"_id": {"$in": [d["_id"] for d in items]}}, {"$set": {"next_poll": now + 300}}
+                )
+                continue
+
+            # Discord says it doesn't repeat and it's over: it was a one-off.
+            if event_is_over(event) and hasattr(event, "recurrence_rule") and event.recurrence_rule is None:
+                await self.coll.delete_many(event_key)
+                continue
+
+            current = event.start_time.timestamp()
+            for doc in items:
+                tracked = doc["event_start"]
+                if now - tracked > GIVE_UP_AFTER and abs(current - tracked) <= ROLLOVER_GRACE:
+                    await self.coll.delete_one({"_id": doc["_id"]})  # no new occurrence for ages: series is over
+                    continue
+                await self.coll.update_one(
+                    {"_id": doc["_id"]},
+                    {"$set": plan_rollover(doc["offset_seconds"], tracked, current, now)},
+                )
 
 
 async def setup(bot):
